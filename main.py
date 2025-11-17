@@ -262,12 +262,43 @@ async def get_current_user_info(
     description="Check if the API is running"
 )
 async def root():
+    import os
     return {
         "status": "online",
         "message": "AI Image Gallery API is running",
         "docs": "/docs",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "env_check": {
+            "SUPABASE_URL": "set" if os.getenv("SUPABASE_URL") else "missing",
+            "SUPABASE_KEY": "set" if os.getenv("SUPABASE_KEY") else "missing",
+            "SUPABASE_JWT_SECRET": "set" if os.getenv("SUPABASE_JWT_SECRET") else "missing",
+            "OPENAI_API_KEY": "set" if os.getenv("OPENAI_API_KEY") else "missing"
+        }
     }
+
+
+@app.get(
+    "/auth/test",
+    tags=["Authentication"],
+    summary="Test authentication",
+    description="Test if authentication is working"
+)
+async def test_auth(credentials: HTTPAuthorizationCredentials = Security(security)):
+    try:
+        from auth_middleware import verify_jwt_token
+        user = await verify_jwt_token(credentials.credentials)
+        return {
+            "status": "success",
+            "message": "Authentication working correctly",
+            "user_id": user["sub"],
+            "email": user.get("email")
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Authentication failed: {str(e)}",
+            "error_type": type(e).__name__
+        }
 
 
 # ============================================================
@@ -278,20 +309,28 @@ async def root():
     "/images/upload",
     tags=["Images"],
     summary="Upload an image",
-    
+
 )
 async def upload_image(
     file: UploadFile = File(..., description="Image file to upload"),
     credentials: HTTPAuthorizationCredentials = Security(security)
 ):
-    from auth_middleware import verify_jwt_token
+    try:
+        from auth_middleware import verify_jwt_token
 
-    # Verify token and get user info
-    user = await verify_jwt_token(credentials.credentials)
-    user_id = user["sub"]
+        # Verify token and get user info
+        user = await verify_jwt_token(credentials.credentials)
+        user_id = user["sub"]
 
-    result = await process_image_upload(file, user_id)
-    return result
+        result = await process_image_upload(file, user_id)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Upload failed: {str(e)}"
+        )
 
 
 @app.post(
