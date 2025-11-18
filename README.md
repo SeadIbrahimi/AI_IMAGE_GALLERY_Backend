@@ -168,11 +168,3 @@ Clean URLs under `/api/v1/...`, showing attention to REST conventions.
 ## 📝 Purpose of This Repository
 
 This project was developed as a **technical portfolio piece** for applying to a **Full-Stack Developer position**.
-
-It is designed to reflect:
-
-- Production-ready code quality
-- Strong understanding of backend systems
-- Ability to integrate multiple modern technologies
-- Engineering judgment and problem-solving
-- Dependability and scalability considerations

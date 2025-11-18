@@ -101,8 +101,8 @@ async def upload_multiple_images(
     summary="Get user's images with filters and sorting",
 )
 async def get_images(
-    limit: int = 20,
-    offset: int = 0,
+    pageSize: int = 20,
+    pageNumber: int = 1,
     search: Optional[str] = None,
     tags: Optional[str] = None,
     colors: Optional[str] = None,
@@ -114,16 +114,16 @@ async def get_images(
     user = await verify_jwt_token(credentials.credentials)
     user_id = user["sub"]
 
-    if limit < 1 or limit > 100:
+    if pageSize < 1 or pageSize > 100:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid limit parameter. Must be between 1 and 100",
+            detail="Invalid pageSize parameter. Must be between 1 and 100",
         )
 
-    if offset < 0:
+    if pageNumber < 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid offset parameter. Must be 0 or greater",
+            detail="Invalid pageNumber parameter. Must be 1 or greater",
         )
 
     tags_list = [t.strip() for t in tags.split(",")] if tags else None
@@ -136,6 +136,10 @@ async def get_images(
             detail=f"Invalid sort_by parameter. Must be one of: {', '.join(valid_sort_options)}",
         )
 
+    # Convert pageNumber and pageSize to offset and limit for the service layer
+    offset = (pageNumber - 1) * pageSize
+    limit = pageSize
+
     result = await get_user_images(
         user_id=user_id,
         limit=limit,
@@ -146,17 +150,14 @@ async def get_images(
         sort_by=sort_by,
     )
 
-    page = (offset // limit) + 1 if limit > 0 else 1
-    total_pages = (result["total"] + limit - 1) // limit if limit > 0 else 1
+    total_pages = (result["total"] + pageSize - 1) // pageSize if pageSize > 0 else 1
 
     return {
         "images": result["images"],
-        "total": result["total"],
-        "count": len(result["images"]),
-        "page": page,
-        "limit": limit,
-        "offset": offset,
-        "total_pages": total_pages,
+        "totalItems": result["total"],
+        "pageNumber": pageNumber,
+        "pageSize": pageSize,
+        "totalPages": total_pages,
     }
 
 

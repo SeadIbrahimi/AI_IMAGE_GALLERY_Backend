@@ -24,6 +24,7 @@ from fastapi import HTTPException, UploadFile, status
 from PIL import Image
 
 from repositories.image_repository import (
+    count_user_images,
     delete_image_record,
     fetch_image_by_id,
     fetch_image_metadata,
@@ -610,6 +611,8 @@ async def get_user_images(
         - Search functionality
     """
     try:
+        start_time = time.time()
+
         # Fetch page of images with embedded metadata from repository
         response = fetch_user_images_with_metadata(
             user_id=user_id,
@@ -618,8 +621,7 @@ async def get_user_images(
             sort_by=sort_by,
         )
 
-        # Get total count from response (keeps existing behavior)
-        total_count = response.count if hasattr(response, "count") else len(response.data)
+        db_time = time.time()
         images = response.data
 
         # Extract metadata from nested structure and flatten
@@ -642,6 +644,8 @@ async def get_user_images(
 
             # Remove the nested metadata structure
             image.pop('image_metadata', None)
+
+        flatten_time = time.time()
 
         # Apply filters in Python (after fetching data)
         filtered_images = images
@@ -687,9 +691,18 @@ async def get_user_images(
                     continue
             filtered_images = search_filtered
 
+        filter_time = time.time()
+
         # Update images and total count after all filters
         images = filtered_images
-        total_count = len(images)
+
+        # For filtered requests, total is the number of results
+        # in the current page. For unfiltered requests, we return
+        # the overall number of images for the user.
+        if search or (tags and len(tags) > 0) or (colors and len(colors) > 0):
+            total_count = len(images)
+        else:
+            total_count = count_user_images(user_id=user_id)
 
         # Add signed URLs and display names
         for image in images:
@@ -704,11 +717,27 @@ async def get_user_images(
                 filename_without_ext = image['filename'].rsplit('.', 1)[0]
                 image['display_name'] = filename_without_ext
 
+        url_time = time.time()
+
         # Apply alphabetical sorting by display_name if requested
         if sort_by == "a-z":
             images = sorted(images, key=lambda x: x['display_name'].lower())
         elif sort_by == "z-a":
             images = sorted(images, key=lambda x: x['display_name'].lower(), reverse=True)
+
+        total_time = time.time()
+
+        # Simple perf logging to help diagnose latency
+        print(
+            f"[PERF] get_user_images user={user_id} "
+            f"db={db_time - start_time:.3f}s "
+            f"flatten={flatten_time - db_time:.3f}s "
+            f"filter={filter_time - flatten_time:.3f}s "
+            f"urls={url_time - filter_time:.3f}s "
+            f"sort={total_time - url_time:.3f}s "
+            f"total={total_time - start_time:.3f}s "
+            f"count={len(images)}"
+        )
 
         return {
             "images": images,

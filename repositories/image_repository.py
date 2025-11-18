@@ -31,7 +31,6 @@ def fetch_user_images_with_metadata(
                 ai_generated_name
             )
             """,
-            count="exact",
         )
         .eq("user_id", user_id)
     )
@@ -45,6 +44,22 @@ def fetch_user_images_with_metadata(
 
     query = query.range(offset, offset + limit - 1)
     return query.execute()
+
+
+def count_user_images(user_id: str) -> int:
+    """
+    Get total number of images for a user.
+
+    This does not apply search/tag/color filters; it is used
+    to populate `totalItems` in the paged `/images` endpoint.
+    """
+    response = (
+        supabase.table("images")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return getattr(response, "count", None) or 0
 
 
 def fetch_image_by_id(user_id: str, image_id: int) -> Any:
