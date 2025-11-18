@@ -15,11 +15,26 @@ Why a separate service file?
 - Better organization
 """
 
-import uuid
 import io
-from typing import Tuple, BinaryIO
-from fastapi import UploadFile, HTTPException, status
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Set, Tuple, BinaryIO
+
+from fastapi import HTTPException, UploadFile, status
 from PIL import Image
+
+from repositories.image_repository import (
+    delete_image_record,
+    fetch_image_by_id,
+    fetch_image_metadata,
+    fetch_images_with_colors,
+    fetch_images_with_tags,
+    fetch_image_owner,
+    fetch_reference_image_with_metadata,
+    fetch_user_images_for_similarity,
+    fetch_user_images_with_metadata,
+    upsert_image_metadata,
+)
 from supabase_client import supabase
 
 # Try to import python-magic, but make it optional
@@ -61,6 +76,11 @@ THUMBNAIL_SIZE = (300, 300)  # 300x300 pixels
 
 # Storage bucket name
 STORAGE_BUCKET = "images"
+
+# Simple in-memory cache for signed URLs to avoid
+# repeated storage requests for the same file path.
+SIGNED_URL_CACHE: Dict[str, Dict[str, Any]] = {}
+SIGNED_URL_CACHE_FRACTION = 0.9  # use 90% of Supabase TTL to stay safe
 
 
 # ============================================================
@@ -526,30 +546,35 @@ async def process_image_upload(file: UploadFile, user_id: str) -> dict:
 
 def get_signed_url(storage_path: str, expires_in: int = 3600) -> str:
     """
-    Generate signed URL for private image
+    Generate signed URL for private image.
 
-    Args:
-        storage_path: Path to file in storage
-        expires_in: URL expiration time in seconds (default: 1 hour)
-
-    Returns:
-        Temporary signed URL
-
-    Why signed URLs?
-        - Bucket is private (RLS protected)
-        - Need temporary access tokens
-        - URLs expire for security
-
-    When to use:
-        - Displaying images to authenticated users
-        - Downloading images
+    Uses a small in-memory cache to avoid making repeated
+    Supabase storage calls for the same path.
     """
+    if not storage_path:
+        return None
+
+    cache_key = f"{storage_path}:{expires_in}"
+    now = time.time()
+
+    cached = SIGNED_URL_CACHE.get(cache_key)
+    if cached and cached.get("expires_at", 0) > now:
+        return cached["url"]
+
     try:
         response = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(
             path=storage_path,
-            expires_in=expires_in
+            expires_in=expires_in,
         )
-        return response['signedURL']
+        url = response["signedURL"]
+
+        SIGNED_URL_CACHE[cache_key] = {
+            "url": url,
+            # Store a slightly shorter TTL locally than Supabase provides
+            "expires_at": now + (expires_in * SIGNED_URL_CACHE_FRACTION),
+        }
+
+        return url
     except Exception as e:
         print(f"⚠ Failed to generate signed URL for {storage_path}: {str(e)}")
         return None
@@ -585,46 +610,16 @@ async def get_user_images(
         - Search functionality
     """
     try:
-        # Build base query for images with metadata join
-        # Use left join (!left) to include images without metadata
-        query = supabase.table('images').select(
-            '''
-            id,
-            filename,
-            file_size,
-            original_path,
-            thumbnail_path,
-            uploaded_at,
-            image_metadata(
-                description,
-                tags,
-                colors,
-                ai_generated_name
-            )
-            ''',
-            count='exact'
-        ).eq('user_id', user_id)
+        # Fetch page of images with embedded metadata from repository
+        response = fetch_user_images_with_metadata(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+        )
 
-        # NOTE: We don't apply database-level filters for tags/colors/search here
-        # because the left join with image_metadata might return null values
-        # We'll filter in Python after fetching the data
-
-        # Apply sorting
-        if sort_by == "oldest":
-            query = query.order('uploaded_at', desc=False)
-        elif sort_by == "recent":
-            query = query.order('uploaded_at', desc=True)
-        # For a-z and z-a, we'll sort in Python after adding display_name
-        else:
-            # Default to recent for now, will sort by display_name later
-            query = query.order('uploaded_at', desc=True)
-
-        # Apply pagination and execute query (count is included in response)
-        query = query.range(offset, offset + limit - 1)
-        response = query.execute()
-
-        # Get total count from response
-        total_count = response.count if hasattr(response, 'count') else len(response.data)
+        # Get total count from response (keeps existing behavior)
+        total_count = response.count if hasattr(response, "count") else len(response.data)
         images = response.data
 
         # Extract metadata from nested structure and flatten
@@ -724,4 +719,375 @@ async def get_user_images(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch images: {str(e)}"
+        )
+
+
+async def get_image_details(user_id: str, image_id: int) -> dict:
+    """
+    Fetch a single image with its metadata and signed URLs for a user.
+    """
+    try:
+        response = fetch_image_by_id(user_id=user_id, image_id=image_id)
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Image not found",
+            )
+
+        image = response.data[0]
+
+        # Add signed URLs
+        image["thumbnail_url"] = get_signed_url(image["thumbnail_path"])
+        image["original_url"] = get_signed_url(image["original_path"])
+
+        # Fetch metadata
+        metadata_response = fetch_image_metadata(image_id=image_id)
+
+        if metadata_response.data:
+            image["metadata"] = metadata_response.data[0]
+
+        # Add display_name: AI-generated name if available, otherwise original filename
+        if metadata_response.data and metadata_response.data[0].get("ai_generated_name"):
+            image["display_name"] = metadata_response.data[0]["ai_generated_name"]
+        else:
+            filename_without_ext = image["filename"].rsplit(".", 1)[0]
+            image["display_name"] = filename_without_ext
+
+        return image
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch image: {str(e)}",
+        )
+
+
+async def delete_user_image(user_id: str, image_id: int) -> dict:
+    """
+    Delete an image (storage + database) for a given user.
+    """
+    try:
+        response = fetch_image_by_id(user_id=user_id, image_id=image_id)
+
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Image not found",
+            )
+
+        image = response.data[0]
+
+        # Delete from storage
+        await delete_from_storage(image["original_path"])
+        await delete_from_storage(image["thumbnail_path"])
+
+        # Delete from database (metadata will cascade delete)
+        delete_image_record(image_id=image_id)
+
+        return {
+            "message": "Image deleted successfully",
+            "image_id": image_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete image: {str(e)}",
+        )
+
+
+async def update_image_metadata_for_user(
+    user_id: str,
+    image_id: int,
+    description: Optional[str],
+    tags: Optional[List[str]],
+    colors: Optional[List[str]],
+) -> dict:
+    """
+    Update or create metadata for an image owned by the given user.
+    """
+    try:
+        # Check at least one field provided
+        if description is None and tags is None and colors is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one field (description, tags, or colors) must be provided",
+            )
+
+        # Verify image exists and belongs to user
+        image_response = fetch_image_owner(user_id=user_id, image_id=image_id)
+
+        if not image_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Image not found",
+            )
+
+        # Build update data (only include provided fields)
+        update_data: Dict[str, Any] = {}
+
+        if description is not None:
+            update_data["description"] = description
+
+        if tags is not None:
+            if not isinstance(tags, list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Tags must be an array of strings",
+                )
+            update_data["tags"] = tags
+
+        if colors is not None:
+            if not isinstance(colors, list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Colors must be an array of strings",
+                )
+
+            for color in colors:
+                if not isinstance(color, str) or not color.startswith("#") or len(color) not in (4, 7):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid color format: {color}. Expected hex format like #FF6B35",
+                    )
+
+            update_data["colors"] = colors
+
+        # Update or insert metadata
+        upsert_image_metadata(image_id=image_id, data=update_data)
+
+        # Fetch updated metadata
+        updated_metadata = fetch_image_metadata(image_id=image_id)
+
+        if not updated_metadata.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to fetch updated metadata",
+            )
+
+        return {
+            "message": "Image metadata updated successfully",
+            "image_id": image_id,
+            "metadata": updated_metadata.data[0],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update image metadata: {str(e)}",
+        )
+
+
+async def get_similar_images_for_user(user_id: str, image_id: int, limit: int = 6) -> dict:
+    """
+    Find images similar to the given image for a user.
+    """
+    try:
+        if limit < 1 or limit > 50:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Limit must be between 1 and 50",
+            )
+
+        # Get reference image with metadata
+        ref_response = fetch_reference_image_with_metadata(image_id=image_id)
+
+        if not ref_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Reference image not found",
+            )
+
+        ref_image = ref_response.data[0]
+
+        # Ownership check
+        if ref_image["user_id"] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this image",
+            )
+
+        # Normalize metadata
+        ref_meta = ref_image.get("image_metadata")
+        if isinstance(ref_meta, list):
+            ref_meta = ref_meta[0] if ref_meta else None
+        elif not isinstance(ref_meta, dict):
+            ref_meta = None
+
+        ref_meta = ref_meta or {}
+        ref_tags = set(ref_meta.get("tags") or [])
+        ref_colors = set(ref_meta.get("colors") or [])
+        ref_description = (ref_meta.get("description") or "").lower()
+
+        ref_keywords: Set[str] = {word for word in ref_description.split() if len(word) > 3}
+
+        # Get candidate images (all user's images except the reference)
+        images = fetch_user_images_for_similarity(user_id=user_id, reference_image_id=image_id)
+
+        similar_images: List[Dict[str, Any]] = []
+
+        for image in images:
+            meta = image.get("image_metadata")
+            if isinstance(meta, list):
+                meta = meta[0] if meta else None
+            elif not isinstance(meta, dict):
+                meta = None
+
+            meta = meta or {}
+            tags = set(meta.get("tags") or [])
+            colors = set(meta.get("colors") or [])
+            description = (meta.get("description") or "").lower()
+
+            # Tag similarity
+            if ref_tags:
+                tag_matches = len(ref_tags.intersection(tags))
+                tag_similarity = (tag_matches / len(ref_tags)) * 100
+            else:
+                tag_similarity = 0
+
+            # Color similarity
+            if ref_colors:
+                color_matches = len(ref_colors.intersection(colors))
+                color_similarity = (color_matches / len(ref_colors)) * 100
+            else:
+                color_similarity = 0
+
+            # Keyword similarity
+            if ref_keywords:
+                keywords: Set[str] = {word for word in description.split() if len(word) > 3}
+                keyword_matches = len(ref_keywords.intersection(keywords))
+                keyword_similarity = (keyword_matches / len(ref_keywords)) * 100
+            else:
+                keyword_similarity = 0
+
+            similarity_percentage = (
+                (tag_similarity * 0.5)
+                + (color_similarity * 0.3)
+                + (keyword_similarity * 0.2)
+            )
+
+            if similarity_percentage > 0:
+                image["description"] = meta.get("description", "")
+                image["tags"] = meta.get("tags") or []
+                image["colors"] = meta.get("colors") or []
+                image["ai_generated_name"] = meta.get("ai_generated_name")
+                image.pop("image_metadata", None)
+
+                image["thumbnail_url"] = get_signed_url(image["thumbnail_path"])
+                image["original_url"] = get_signed_url(image["original_path"])
+
+                if image.get("ai_generated_name"):
+                    image["display_name"] = image["ai_generated_name"]
+                else:
+                    filename_without_ext = image["filename"].rsplit(".", 1)[0]
+                    image["display_name"] = filename_without_ext
+
+                image["similarity_percentage"] = round(similarity_percentage, 1)
+
+                similar_images.append(image)
+
+        similar_images.sort(key=lambda x: x["similarity_percentage"], reverse=True)
+        similar_images = similar_images[:limit]
+
+        return {
+            "reference_image_id": image_id,
+            "similar_images": similar_images,
+            "count": len(similar_images),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to find similar images: {str(e)}",
+        )
+
+
+async def get_recent_tags_for_user(user_id: str, limit: int = 6) -> dict:
+    """
+    Get the most recently used tags for a user.
+    """
+    try:
+        response = fetch_images_with_tags(user_id=user_id)
+
+        seen_tags: Set[str] = set()
+        recent_tags: List[str] = []
+
+        for image in response.data or []:
+            metadata = image.get("image_metadata")
+            if isinstance(metadata, list):
+                metadata = metadata[0] if metadata else None
+            elif not isinstance(metadata, dict):
+                metadata = None
+
+            tags = (metadata or {}).get("tags") or []
+
+            for tag in tags:
+                if tag not in seen_tags:
+                    seen_tags.add(tag)
+                    recent_tags.append(tag)
+                    if len(recent_tags) >= limit:
+                        break
+            if len(recent_tags) >= limit:
+                break
+
+        return {
+            "tags": recent_tags,
+            "count": len(recent_tags),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch recent tags: {str(e)}",
+        )
+
+
+async def get_popular_colors_for_user(user_id: str, limit: int = 8) -> dict:
+    """
+    Get the most frequently used colors for a user.
+    """
+    try:
+        from collections import Counter
+
+        response = fetch_images_with_colors(user_id=user_id)
+
+        color_counter: Counter = Counter()
+
+        for image in response.data or []:
+            metadata = image.get("image_metadata")
+            if isinstance(metadata, list):
+                metadata = metadata[0] if metadata else None
+            elif not isinstance(metadata, dict):
+                metadata = None
+
+            colors = (metadata or {}).get("colors") or []
+            for color in colors:
+                color_counter[color] += 1
+
+        top_colors = color_counter.most_common(limit)
+
+        return {
+            "colors": [
+                {
+                    "color": color,
+                    "count": count,
+                }
+                for color, count in top_colors
+            ],
+            "total": len(top_colors),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch popular colors: {str(e)}",
         )
