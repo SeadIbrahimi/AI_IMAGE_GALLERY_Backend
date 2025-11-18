@@ -35,11 +35,9 @@ def fetch_user_images_with_metadata(
         .eq("user_id", user_id)
     )
 
-    # Keep the same sort semantics as before
     if sort_by == "oldest":
         query = query.order("uploaded_at", desc=False)
     else:
-        # "recent", "a-z", "z-a" all start sorted by recent; alpha sort happens in Python
         query = query.order("uploaded_at", desc=True)
 
     query = query.range(offset, offset + limit - 1)

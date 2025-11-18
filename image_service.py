@@ -53,6 +53,9 @@ except ImportError:
 
 # File validation
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+# Reasonable safety cap for extremely large images (pixels)
+MAX_IMAGE_WIDTH = 8000
+MAX_IMAGE_HEIGHT = 8000
 # Accept all image formats
 ALLOWED_MIME_TYPES = [
     "image/jpeg",
@@ -153,10 +156,23 @@ async def validate_image_file(file: UploadFile) -> None:
         # Skip magic bytes check if library not available
         print("⚠️  Skipping magic bytes validation (python-magic not available)")
 
-    # Check 4: Can we open it as an image?
+    # Check 4: Can we open it as an image and is it a reasonable size?
     try:
         image = Image.open(io.BytesIO(contents))
+        width, height = image.size
+
+        if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Image dimensions too large. "
+                    f"Maximum allowed is {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT} pixels."
+                ),
+            )
+
         image.verify()  # Verify it's a valid image
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
