@@ -3,9 +3,9 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials
 
-from schemas import AuthResponse, LoginRequest, SignupRequest
+from schemas import AuthResponse, LoginRequest, RefreshTokenRequest, SignupRequest
 from security import security
-from services.auth_service import login_user, logout_user, signup_user
+from services.auth_service import login_user, logout_user, refresh_access_token, signup_user
 
 
 router = APIRouter(tags=["Authentication"])
@@ -28,6 +28,16 @@ async def signup(auth: SignupRequest) -> Dict[str, Any]:
 )
 async def login(auth: LoginRequest) -> Dict[str, Any]:
     return await login_user(auth)
+
+
+@router.post(
+    "/auth/refresh",
+    response_model=AuthResponse,
+    summary="Refresh access token",
+    description="Get a new access token using a refresh token",
+)
+async def refresh_token(refresh_req: RefreshTokenRequest) -> Dict[str, Any]:
+    return await refresh_access_token(refresh_req)
 
 
 @router.post(

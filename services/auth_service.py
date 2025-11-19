@@ -3,7 +3,7 @@ from typing import Any, Dict
 from fastapi import HTTPException, status
 
 from auth_middleware import verify_jwt_token
-from schemas import LoginRequest, SignupRequest
+from schemas import LoginRequest, RefreshTokenRequest, SignupRequest
 from supabase_client import supabase
 
 
@@ -64,6 +64,39 @@ async def login_user(auth: LoginRequest) -> Dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Login failed: {str(e)}",
+        )
+
+
+async def refresh_access_token(refresh_token_req: RefreshTokenRequest) -> Dict[str, Any]:
+    """
+    Refresh the access token using the provided refresh token.
+    """
+    try:
+        response = supabase.auth.refresh_session(refresh_token_req.refresh_token)
+
+        if not response.session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired refresh token",
+            )
+
+        return {
+            "message": "Token refreshed successfully",
+            "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
+            "user": {
+                "id": response.user.id,
+                "email": response.user.email,
+            },
+            "expires_in": response.session.expires_in,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token refresh failed: {str(e)}",
         )
 
 

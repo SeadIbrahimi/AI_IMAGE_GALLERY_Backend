@@ -29,6 +29,17 @@ class LoginRequest(BaseModel):
         }
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., description="Refresh token received during login/signup")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+            }
+        }
+
+
 class AuthResponse(BaseModel):
     message: str
     access_token: str

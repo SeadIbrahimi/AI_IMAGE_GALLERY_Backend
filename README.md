@@ -127,6 +127,9 @@ Includes:
 - Full-text search index
 - GIN indexes for tags
 
+The full SQL definition for tables, indexes, and RLS policies is published in `supabase/schema.sql`.  
+You can run this file directly in the Supabase SQL editor or include it as part of a Supabase migration to recreate the database schema.
+
 ---
 
 ## 📡 API Endpoints
